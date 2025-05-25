@@ -1,0 +1,6 @@
+click>=8.0
+spotipy>=2.22.0
+python-dotenv>=1.0
+requests
+tqdm
+numpy
