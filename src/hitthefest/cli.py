@@ -9,6 +9,9 @@ from spotipy import Spotify
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
 import unicodedata
+from PIL import Image
+import base64
+import io
 
 # Load .env for Spotify credentials
 load_dotenv()
@@ -238,6 +241,67 @@ def add_tracks_to_playlist_with_progress(sp, playlist_id, tracks):
     click.echo("Uploading tracks to Spotify...")
     for i in tqdm(range(0, len(tracks), chunk_size), desc="Uploading"):
         sp.playlist_add_items(playlist_id, tracks[i:i+chunk_size])
+        
+def create_playlist_cover_with_logo(festival_dir):
+    """
+    Opens /data/<festival>/cover.jpg and /data/HTF-small.png, overlays the logo at bottom right,
+    returns the result as JPEG bytes (for Spotify upload). Ensures <=256KB output size.
+    """
+    cover_path = os.path.join(DATA_DIR, festival_dir, "cover.jpg")
+    logo_path = os.path.join(DATA_DIR, "HTF-small.png")
+    cover = Image.open(cover_path).convert("RGB")
+    # Resize cover to max 600x600px (Spotify recommendation)
+    cover.thumbnail((600, 600), Image.LANCZOS)
+    logo = Image.open(logo_path).convert("RGBA")
+    # Resize logo (make it 20% of cover width)
+    logo_width = int(cover.width * 0.20)
+    logo_height = int(logo_width * logo.height / logo.width)
+    logo = logo.resize((logo_width, logo_height), Image.LANCZOS)
+    # Position: bottom right with 3% margin
+    margin = int(cover.width * 0.03)
+    pos = (cover.width - logo.width - margin, cover.height - logo.height - margin)
+    # Paste logo with alpha
+    cover_rgba = cover.convert("RGBA")
+    cover_rgba.paste(logo, pos, logo)
+    # Save as JPEG, decrease quality if needed to stay under 256KB
+    quality = 90
+    max_size = 256 * 1024  # 256 KB
+    for attempt in range(8):
+        buffer = io.BytesIO()
+        cover_rgba.convert("RGB").save(buffer, format="JPEG", quality=quality)
+        jpeg_bytes = buffer.getvalue()
+        buffer.close()
+        if len(jpeg_bytes) <= max_size:
+            break
+        quality -= 10  # decrease quality if too large
+        if quality < 30:
+            break  # don't go lower than this
+    return jpeg_bytes
+
+
+def upload_playlist_cover(sp, playlist_id, festival_dir, debug=False):
+    """
+    Sets the playlist cover to the festival cover with the logo overlay.
+    """
+    jpeg_bytes = create_playlist_cover_with_logo(festival_dir)
+    # Spotify expects base64 string
+    img_base64 = base64.b64encode(jpeg_bytes).decode('utf-8')
+    try:
+        sp.playlist_upload_cover_image(playlist_id, img_base64)
+        if debug:
+            print_debug("Playlist cover uploaded successfully!", debug)
+    except Exception as e:
+        click.echo(f"[ERROR] Failed to upload playlist cover: {e}")
+        
+def get_playlist_description():
+    today = datetime.now()
+    date_str = today.strftime("%d %B %Y")
+    return (
+        "🎧 Enjoy the festival playlist automatically created by HitTheFest. "
+        "Tracks have been selected considering the popularity of participating artists. "
+        "🔗 More info: https://github.com/juanked/HitTheFest "
+        f"📅 Created on {date_str}."
+    )
 
 def print_summary(playlist_name, festival, num_artists, num_tracks):
     click.echo("\nSummary:")
@@ -245,6 +309,8 @@ def print_summary(playlist_name, festival, num_artists, num_tracks):
     click.echo(f"Festival: {festival}")
     click.echo(f"Number of artists: {num_artists}")
     click.echo(f"Number of tracks to add: {num_tracks}\n")
+
+from datetime import datetime
 
 @click.command()
 @click.option('--playlist-name', default=None, help="Name for the new Spotify playlist.")
@@ -272,7 +338,7 @@ def main(playlist_name, code, festival, debug):
         client_id=SPOTIPY_CLIENT_ID,
         client_secret=SPOTIPY_CLIENT_SECRET,
         redirect_uri=SPOTIPY_REDIRECT_URI,
-        scope="playlist-modify-public playlist-modify-private",
+        scope="playlist-modify-public playlist-modify-private ugc-image-upload",
     )
 
     # Playlist name and Spotify code (show auth_url if needed)
@@ -291,9 +357,11 @@ def main(playlist_name, code, festival, debug):
         click.echo("Aborted.")
         sys.exit(0)
 
-    # Create playlist and add tracks (with tqdm for progress)
-    click.echo("Creating playlist on Spotify...")
-    new_playlist = sp.user_playlist_create(user_id, playlist_name)
+# Create playlist and add tracks (with tqdm for progress)
+    desc = get_playlist_description()
+    new_playlist = sp.user_playlist_create(user_id, playlist_name, description=desc)
+
+    upload_playlist_cover(sp, new_playlist["id"], selected_festival, debug=debug)
     add_tracks_to_playlist_with_progress(sp, new_playlist["id"], tracks_to_add)
     click.echo(f"Playlist '{playlist_name}' created with {len(tracks_to_add)} tracks!")
 
